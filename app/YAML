@@ -1,0 +1,99 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+
+  scan:
+    name: Security Scans
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          echo "image_tag=secure-app:${GITHUB_SHA}" >> $GITHUB_OUTPUT
+
+      # --- SAST (Semgrep) ---
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: .semgrep.yml
+
+      # --- Dependency Scan (pip-audit) ---
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Run Dependency Scan
+        run: |
+          pip-audit -r requirements.txt -f json -o dep-scan.json
+
+      # --- Secret Scan (Gitleaks) ---
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --report-format json --report-path secrets.json
+
+      # Upload scan artifacts
+      - name: Upload Scan Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results
+          path: |
+            dep-scan.json
+            secrets.json
+
+  build:
+    name: Build, Scan, and SBOM
+    runs-on: ubuntu-latest
+    needs: scan
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker Image
+        run: |
+          docker build -t secure-app:${GITHUB_SHA} .
+
+      # --- Container Scan (Trivy) ---
+      - name: Run Trivy Scan
+        uses: aquasecurity/trivy-action@v0.20.0
+        with:
+          image-ref: secure-app:${{ github.sha }}
+          format: json
+          output: trivy-report.json
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+      # --- SBOM Generation (Syft) ---
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: secure-app:${{ github.sha }}
+          format: cyclonedx-json
+          output-file: sbom.json
+
+      # Trusted build marker
+      - name: Mark Trusted Build
+        run: |
+          echo "trusted-build=true" > trusted.txt
+          echo "image=secure-app:${GITHUB_SHA}" >> trusted.txt
+
+      # Upload artifacts
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            trivy-report.json
+            sbom.json
+            trusted.txt
